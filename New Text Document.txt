@@ -1,0 +1,1200 @@
+Here i need to add in 7 steps?
+During client side cert process i am getting this. I don't have password of client cert
+
+Perfect. Those two headers confirm the formats:
+
+Zy-certificate-pem-x-509-pem (1).pem → PEM X.509 certificate
+Zy-private-key-mtls.pem → PEM PKCS#8 private key
+
+So the file types themselves look correct. The earlier error happened because the private-key file was accidentally passed to openssl x509, which only reads certificates.
+
+Let's continue carefully.
+
+1. Verify the certificate
+
+Run:
+
+openssl x509 -in "Zy-certificate-pem-x-509-pem (1).pem" \
+  -noout -subject -issuer -dates
+
+You should get something similar to:
+
+subject=...
+issuer=...
+notBefore=...
+notAfter=...
+2. Verify the private key
+
+Run:
+
+openssl pkey -in "Zy-private-key-mtls.pem" -noout
+
+If it returns no error, the private key is readable.
+
+3. Check whether they match
+
+Now run these exact commands:
+
+openssl x509 -in "Zy-certificate-pem-x-509-pem (1).pem" \
+  -pubkey -noout > /tmp/cert.pub
+openssl pkey -in "Zy-private-key-mtls.pem" \
+  -pubout > /tmp/key.pub
+
+Then:
+
+diff /tmp/cert.pub /tmp/key.pub
+If you get no output:
+
+✅ The certificate and private key match.
+
+That's what we want.
+
+4. Then create the PKCS#12 file for Burp
+
+Assuming the diff produces no output:
+
+openssl pkcs12 -export \
+  -in "Zy-certificate-pem-x-509-pem (1).pem" \
+  -inkey "Zy-private-key-mtls.pem" \
+  -out client.p12
+
+You'll see:
+
+Enter Export Password:
+Verifying - Enter Export Password:
+
+Create a password yourself.
+
+For example:
+
+BurpClientP12@2026
+
+This password protects the new client.p12 file. It is not the client's original certificate password.
+
+5. Verify it
+openssl pkcs12 -info -in client.p12 -noout
+
+Enter the password you just created.
+
+Then we'll configure Burp
+
+Once client.p12 is successfully created, don't change anything else yet.
+
+The next configuration will be:
+
+Burp 7.3
+  ↓
+Settings
+  ↓
+Network
+  ↓
+TLS
+  ↓
+Client TLS Certificates
+  ↓
+Add
+
+and we'll configure:
+
+Destination host = your API hostname
+Certificate = client.p12
+Password = password you created
+
+Don't use the Burp CA certificate in this field.
+
+Your setup will be:
+
+                    ┌─────────────┐
+                    │   Postman   │
+                    └──────┬──────┘
+                           │
+                    trusts Burp CA
+                           │
+                           ▼
+                    ┌─────────────┐
+                    │    Burp     │
+                    │    7.3      │
+                    └──────┬──────┘
+                           │
+                   client.p12
+             (client cert + private key)
+                           │
+                           ▼
+                    ┌─────────────┐
+                    │ API / mTLS  │
+                    └─────────────┘
+
+Run steps 1–3 first. If diff gives no output, you're ready for the PKCS#12 conversion. If it gives differences or another error, paste only the error/output—never paste the private key.
+
+Now could you create python script for the same. Where in the start of command you ask for file path with file name for Client cert and private key and Password which user want to set for .p12 file. Then check all the ways autometically and create client.p12 file which is valid for burpsuite interception.
+Analysis errored
+from pathlib import Path
+
+script = r'''#!/usr/bin/env python3
+"""
+Create a Burp Suite-compatible PKCS#12 client certificate from a PEM/DER
+certificate and PEM/DER private key.
+
+The script:
+  1. Prompts for certificate and private-key paths.
+  2. Prompts for the password to protect the generated client.p12.
+  3. Detects PEM/DER certificate and key formats.
+  4. Validates the certificate and private key.
+  5. Checks certificate/key match.
+  6. Checks certificate validity dates.
+  7. Checks Extended Key Usage for TLS client authentication when present.
+  8. Detects additional certificates in the certificate PEM and includes them
+     as the CA/chain portion of the PKCS#12 where appropriate.
+  9. Creates client.p12 using OpenSSL.
+ 10. Re-opens the generated PKCS#12 and verifies that it contains a private
+     key and certificate.
+ 11. Writes client.p12 beside this script (or to a user-selected output path).
+
+Requirements:
+  - Python 3
+  - OpenSSL available in PATH
+
+IMPORTANT:
+  - Never share your private key.
+  - If the private key itself is encrypted, the script will ask for its
+    existing key password. The PKCS#12 password is a NEW password you choose.
+"""
+
+import base64
+import getpass
+import hashlib
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+
+def die(msg):
+    print(f"\n[!] {msg}")
+    sys.exit(1)
+
+
+def run(cmd, input_text=None, check=False):
+    try:
+        p = subprocess.run(
+            cmd,
+            input=input_text,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        die("OpenSSL was not found. Install OpenSSL and make sure 'openssl' is in PATH.")
+    if check and p.returncode != 0:
+        print(p.stderr.strip())
+        die("OpenSSL command failed.")
+    return p
+
+
+def ask_path(prompt, must_exist=True):
+    while True:
+        value = input(prompt).strip().strip('"').strip("'")
+        if not value:
+            print("[!] Please enter a path.")
+            continue
+        path = Path(os.path.expanduser(value)).resolve()
+        if must_exist and not path.is_file():
+            print(f"[!] File not found: {path}")
+            continue
+        return path
+
+
+def ask_password(prompt, confirm=False):
+    while True:
+        pw = getpass.getpass(prompt)
+        if not pw:
+            print("[!] Password cannot be empty.")
+            continue
+        if confirm:
+            pw2 = getpass.getpass("Confirm password: ")
+            if pw != pw2:
+                print("[!] Passwords do not match.")
+                continue
+        return pw
+
+
+def detect_cert_format(cert_path):
+    data = cert_path.read_bytes()
+    if b"-----BEGIN CERTIFICATE-----" in data:
+        return "PEM"
+    p = run(["openssl", "x509", "-inform", "DER", "-in", str(cert_path), "-noout"])
+    if p.returncode == 0:
+        return "DER"
+    return "UNKNOWN"
+
+
+def detect_key_format(key_path):
+    data = key_path.read_bytes()
+
+    pem_markers = [
+        b"-----BEGIN PRIVATE KEY-----",
+        b"-----BEGIN ENCRYPTED PRIVATE KEY-----",
+        b"-----BEGIN RSA PRIVATE KEY-----",
+        b"-----BEGIN EC PRIVATE KEY-----",
+        b"-----BEGIN DSA PRIVATE KEY-----",
+    ]
+
+    if any(x in data for x in pem_markers):
+        return "PEM"
+
+    # Try common DER/private-key forms.
+    for inform in ("DER",):
+        p = run(["openssl", "pkey", "-inform", inform, "-in", str(key_path), "-noout"])
+        if p.returncode == 0:
+            return "DER"
+
+    return "UNKNOWN"
+
+
+def pem_certificates(cert_path):
+    text = cert_path.read_text(errors="strict")
+    blocks = re.findall(
+        r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----",
+        text,
+        flags=re.DOTALL,
+    )
+    return blocks
+
+
+def write_temp_pem(content, suffix=".pem"):
+    f = tempfile.NamedTemporaryFile(mode="w", suffix=suffix, delete=False)
+    f.write(content)
+    f.close()
+    return Path(f.name)
+
+
+def sha256_public_key_from_cert(cert_path, inform=None):
+    cmd = ["openssl", "x509"]
+    if inform:
+        cmd += ["-inform", inform]
+    cmd += ["-in", str(cert_path), "-pubkey", "-noout"]
+    p = run(cmd)
+    if p.returncode != 0:
+        return None, p.stderr.strip()
+
+    pub = p.stdout.encode()
+    # Normalize by hashing the DER SubjectPublicKeyInfo.
+    with tempfile.NamedTemporaryFile(mode="wb", suffix=".pub.pem", delete=False) as f:
+        f.write(pub)
+        pubfile = f.name
+
+    try:
+        q = run(["openssl", "pkey", "-pubin", "-in", pubfile, "-outform", "DER"])
+        if q.returncode != 0:
+            return None, q.stderr.strip()
+        return hashlib.sha256(q.stdout).hexdigest(), None
+    finally:
+        os.unlink(pubfile)
+
+
+def sha256_public_key_from_key(key_path, inform=None, key_password=None):
+    cmd = ["openssl", "pkey"]
+    if inform:
+        cmd += ["-inform", inform]
+    cmd += ["-in", str(key_path), "-pubout"]
+
+    if key_password is not None:
+        cmd += ["-passin", "stdin"]
+        p = run(cmd, input_text=key_password + "\n")
+    else:
+        p = run(cmd)
+
+    if p.returncode != 0:
+        return None, p.stderr.strip()
+
+    with tempfile.NamedTemporaryFile(mode="wb", suffix=".pub.pem", delete=False) as f:
+        f.write(p.stdout.encode())
+        pubfile = f.name
+
+    try:
+        q = run(["openssl", "pkey", "-pubin", "-in", pubfile, "-outform", "DER"])
+        if q.returncode != 0:
+            return None, q.stderr.strip()
+        return hashlib.sha256(q.stdout).hexdigest(), None
+    finally:
+        os.unlink(pubfile)
+
+
+def cert_info(cert_path, inform=None):
+    cmd = ["openssl", "x509"]
+    if inform:
+        cmd += ["-inform", inform]
+    cmd += ["-in", str(cert_path), "-noout", "-subject", "-issuer",
+            "-serial", "-dates", "-ext", "extendedKeyUsage"]
+
+    p = run(cmd)
+    if p.returncode != 0:
+        return None, p.stderr.strip()
+    return p.stdout, None
+
+
+def cert_pem_normalized(cert_path, inform=None):
+    cmd = ["openssl", "x509"]
+    if inform:
+        cmd += ["-inform", inform]
+    cmd += ["-in", str(cert_path), "-out", "-"]
+    p = run(cmd)
+    if p.returncode != 0:
+        return None, p.stderr.strip()
+    return p.stdout, None
+
+
+def main():
+    print("=" * 72)
+    print("  Burp Suite mTLS Client Certificate -> PKCS#12 (.p12)")
+    print("=" * 72)
+    print("\nThis creates a NEW password-protected PKCS#12 container.")
+    print("It does not modify your original certificate or private-key files.\n")
+
+    # Check OpenSSL.
+    v = run(["openssl", "version"])
+    if v.returncode != 0:
+        die("OpenSSL is not available.")
+    print(f"[+] {v.stdout.strip()}")
+
+    cert_path = ask_path("\nEnter CLIENT CERTIFICATE path: ")
+    key_path = ask_path("Enter PRIVATE KEY path: ")
+
+    p12_password = ask_password(
+        "\nEnter password to set for the generated client.p12: ",
+        confirm=True,
+    )
+
+    print("\n[*] Detecting certificate format...")
+    cert_format = detect_cert_format(cert_path)
+    print(f"[+] Certificate format: {cert_format}")
+
+    print("[*] Detecting private-key format...")
+    key_format = detect_key_format(key_path)
+    print(f"[+] Private-key format: {key_format}")
+
+    if cert_format == "UNKNOWN":
+        die("The certificate file is not recognized as PEM or DER X.509.")
+    if key_format == "UNKNOWN":
+        die("The private-key file is not recognized as a supported PEM/DER private key.")
+
+    cert_inform = None if cert_format == "PEM" else "DER"
+    key_inform = None if key_format == "PEM" else "DER"
+
+    # Validate certificate.
+    print("\n[*] Validating client certificate...")
+    info, err = cert_info(cert_path, cert_inform)
+    if err:
+        die(f"Could not parse the client certificate:\n{err}")
+    print("[+] Certificate parsed successfully.")
+    print("\n" + info.strip())
+
+    # Validate private key and determine whether it is encrypted.
+    print("\n[*] Validating private key...")
+    p = run(
+        (["openssl", "pkey"] +
+         (["-inform", key_inform] if key_inform else []) +
+         ["-in", str(key_path), "-noout"])
+    )
+
+    key_password = None
+    if p.returncode != 0:
+        error_lower = (p.stderr or "").lower()
+        encrypted_hint = (
+            "bad decrypt" in error_lower
+            or "bad password" in error_lower
+            or "maybe wrong password" in error_lower
+            or "unable to get passphrase" in error_lower
+            or "pass phrase" in error_lower
+            or "password" in error_lower
+        )
+
+        if encrypted_hint or b"ENCRYPTED PRIVATE KEY" in key_path.read_bytes():
+            print("[!] The private key appears to be encrypted.")
+            key_password = getpass.getpass(
+                "Enter the EXISTING password for the private key: "
+            )
+            p2 = run(
+                (["openssl", "pkey"] +
+                 (["-inform", key_inform] if key_inform else []) +
+                 ["-in", str(key_path), "-noout", "-passin", "stdin"]),
+                input_text=key_password + "\n",
+            )
+            if p2.returncode != 0:
+                die("The supplied private-key password did not unlock the key.")
+        else:
+            die(f"Could not parse the private key:\n{p.stderr.strip()}")
+
+    print("[+] Private key parsed successfully.")
+
+    # Compare public keys.
+    print("\n[*] Checking whether certificate and private key MATCH...")
+    cert_pub_hash, err1 = sha256_public_key_from_cert(cert_path, cert_inform)
+    key_pub_hash, err2 = sha256_public_key_from_key(
+        key_path, key_inform, key_password
+    )
+
+    if err1:
+        die(f"Could not extract public key from certificate:\n{err1}")
+    if err2:
+        die(f"Could not extract public key from private key:\n{err2}")
+
+    print(f"[+] Certificate public-key SHA-256: {cert_pub_hash}")
+    print(f"[+] Private-key public-key SHA-256: {key_pub_hash}")
+
+    if cert_pub_hash != key_pub_hash:
+        die(
+            "CERTIFICATE AND PRIVATE KEY DO NOT MATCH.\n"
+            "Do not create the .p12 until the correct certificate/key pair is obtained."
+        )
+
+    print("[+] MATCH confirmed.")
+
+    # Check whether certificate is currently valid.
+    print("\n[*] Checking certificate validity dates...")
+    date_cmd = ["openssl", "x509"]
+    if cert_inform:
+        date_cmd += ["-inform", cert_inform]
+    date_cmd += ["-in", str(cert_path), "-checkend", "0", "-noout"]
+    date_check = run(date_cmd)
+    if date_check.returncode == 0:
+        print("[+] Certificate is currently valid according to OpenSSL.")
+    else:
+        print("[!] WARNING: Certificate appears expired or not yet valid.")
+
+    # Check EKU.
+    print("\n[*] Checking Extended Key Usage...")
+    eku_cmd = ["openssl", "x509"]
+    if cert_inform:
+        eku_cmd += ["-inform", cert_inform]
+    eku_cmd += ["-in", str(cert_path), "-noout", "-ext", "extendedKeyUsage"]
+    eku = run(eku_cmd)
+
+    eku_text = eku.stdout.strip()
+    if eku.returncode == 0 and eku_text:
+        print(eku_text)
+        if re.search(r"TLS Web Client Authentication|clientAuth|Client Authentication",
+                     eku_text, re.IGNORECASE):
+            print("[+] Client Authentication EKU detected.")
+        else:
+            print("[!] WARNING: A Client Authentication EKU was not detected.")
+            print("    The server may still accept it depending on its policy.")
+    else:
+        print("[!] No Extended Key Usage extension was found/read.")
+        print("    This is not automatically an error; server policy determines acceptance.")
+
+    # Normalize certificate to PEM for PKCS#12 creation.
+    workdir = Path(tempfile.mkdtemp(prefix="burp_mtls_"))
+    cleanup = True
+
+    try:
+        leaf_pem_path = workdir / "client-cert.pem"
+
+        normalized, err = cert_pem_normalized(cert_path, cert_inform)
+        if err:
+            die(f"Could not normalize certificate to PEM:\n{err}")
+        leaf_pem_path.write_text(normalized)
+
+        # If the source is PEM, collect additional certificate blocks.
+        chain_path = None
+        blocks = []
+        if cert_format == "PEM":
+            blocks = pem_certificates(cert_path)
+
+        if len(blocks) > 1:
+            # The first certificate is treated as the client certificate.
+            chain_blocks = blocks[1:]
+            chain_path = workdir / "chain.pem"
+            chain_path.write_text("\n".join(chain_blocks) + "\n")
+            print(f"\n[+] Detected {len(blocks)} certificates in the PEM file.")
+            print(f"[+] Including {len(chain_blocks)} additional certificate(s) as chain.")
+        else:
+            print("\n[*] No additional certificate chain was found in the certificate file.")
+
+        # Output path.
+        default_output = Path.cwd() / "client.p12"
+        output_input = input(
+            f"\nOutput path [default: {default_output}]: "
+        ).strip().strip('"').strip("'")
+        output_path = (
+            Path(os.path.expanduser(output_input)).resolve()
+            if output_input
+            else default_output.resolve()
+        )
+
+        if output_path.exists():
+            answer = input(
+                f"[!] {output_path} already exists. Overwrite? [y/N]: "
+            ).strip().lower()
+            if answer != "y":
+                die("Cancelled to avoid overwriting the existing .p12.")
+        
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Build PKCS#12.
+        print("\n[*] Creating PKCS#12 container...")
+
+        cmd = [
+            "openssl", "pkcs12", "-export",
+            "-out", str(output_path),
+            "-in", str(leaf_pem_path),
+            "-name", "Burp-mTLS-client",
+            "-passout", "stdin",
+        ]
+
+        if key_inform:
+            # We first normalize DER key to PEM so pkcs12 handling is uniform.
+            normalized_key = workdir / "client-key.pem"
+            key_cmd = [
+                "openssl", "pkey",
+                "-inform", key_inform,
+                "-in", str(key_path),
+                "-out", str(normalized_key),
+            ]
+            if key_password is not None:
+                key_cmd += ["-passin", "stdin"]
+                kp = run(key_cmd, input_text=key_password + "\n")
+            else:
+                kp = run(key_cmd)
+            if kp.returncode != 0:
+                die(f"Could not normalize private key:\n{kp.stderr.strip()}")
+            key_for_p12 = normalized_key
+        else:
+            key_for_p12 = key_path
+
+        cmd += ["-inkey", str(key_for_p12)]
+
+        if chain_path:
+            cmd += ["-certfile", str(chain_path)]
+
+        # Use a single stdin payload for PKCS#12 password.
+        p12_result = run(cmd, input_text=p12_password + "\n")
+        if p12_result.returncode != 0:
+            die(f"PKCS#12 creation failed:\n{p12_result.stderr.strip()}")
+
+        # Lock down permissions on Unix-like systems.
+        try:
+            os.chmod(output_path, 0o600)
+        except OSError:
+            pass
+
+        print(f"[+] Created: {output_path}")
+
+        # Verify generated PKCS#12.
+        print("\n[*] Verifying generated client.p12...")
+        verify = run([
+            "openssl", "pkcs12",
+            "-in", str(output_path),
+            "-info",
+            "-noout",
+            "-passin", "stdin",
+        ], input_text=p12_password + "\n")
+
+        if verify.returncode != 0:
+            die(
+                "The generated PKCS#12 could not be opened with the password "
+                "you just set:\n" + verify.stderr.strip()
+            )
+
+        out_lower = verify.stderr.lower()
+        has_private_key = "private key" in out_lower
+        has_certificate = "certificate" in out_lower
+
+        if has_private_key:
+            print("[+] Private key present in PKCS#12.")
+        else:
+            print("[!] WARNING: OpenSSL verification did not clearly report a private key.")
+
+        if has_certificate:
+            print("[+] Certificate present in PKCS#12.")
+        else:
+            print("[!] WARNING: OpenSSL verification did not clearly report a certificate.")
+
+        print("\n" + "=" * 72)
+        print("SUCCESS")
+        print("=" * 72)
+        print(f"PKCS#12 file : {output_path}")
+        print("Password     : the NEW password you entered for client.p12")
+        print("\nBurp Suite:")
+        print("  Settings -> Network -> TLS -> Client TLS Certificates")
+        print("  Add a rule for the exact API hostname.")
+        print("  Select the generated client.p12 and enter its password.")
+        print("\nIMPORTANT:")
+        print("  - Keep client.p12 and its password confidential.")
+        print("  - Do NOT use the Burp CA as the mTLS client certificate.")
+        print("  - The Burp CA is separately used so Postman trusts Burp.")
+        print("=" * 72)
+
+    finally:
+        # Securely remove temporary copies. (Best-effort; filesystem semantics vary.)
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+path = "/mnt/data/burp_mtls_p12_creator.py"
+with open(path, "w", encoding="utf-8") as f:
+    f.write(script)
+os.chmod(path, 0o700)
+
+print(f"Created: {path}")
+
+---------------------------------------------------------------------------
+NameError                                 Traceback (most recent call last)
+Cell In[1], line 513
+    509 
+    510 path = "/mnt/data/burp_mtls_p12_creator.py"
+    511 with open(path, "w", encoding="utf-8") as f:
+    512     f.write(script)
+--> 513 os.chmod(path, 0o700)
+    514 
+    515 print(f"Created: {path}")
+
+NameError: name 'os' is not defined
+
+Analysis errored
+import os
+# `script` was created in the previous cell before the final chmod line failed.
+path = "/mnt/data/burp_mtls_p12_creator.py"
+with open(path, "w", encoding="utf-8") as f:
+    f.write(script)
+os.chmod(path, 0o700)
+print(f"Created: {path}")
+
+
+It seems like I can’t do more advanced data analysis right now. Please try again later. 
+
+Please do it today only
+Analysis errored
+from pathlib import Path
+import os, textwrap
+
+script = r'''#!/usr/bin/env python3
+"""
+Burp Suite mTLS PKCS#12 Creator
+
+Creates a password-protected client.p12 from a client certificate and
+private key, then validates the result.
+
+Requirements:
+  - Python 3
+  - OpenSSL 3.x or compatible, available as `openssl`
+
+The script:
+  * Prompts for certificate and private-key paths.
+  * Prompts for a NEW password for the generated .p12.
+  * Detects PEM/DER certificate and private-key formats.
+  * Validates certificate and key.
+  * Automatically handles encrypted private keys by asking for the
+    EXISTING private-key password only when required.
+  * Verifies certificate/key correspondence using public-key hashes.
+  * Checks certificate dates and EKU when available.
+  * Detects multiple certificates in a PEM certificate file and includes
+    additional certificates as the PKCS#12 chain.
+  * Creates and verifies client.p12.
+  * Never prints the private key or passwords.
+
+IMPORTANT:
+  client.crt/client certificate + client.key/private key are sensitive.
+  Keep the generated client.p12 and its password confidential.
+"""
+
+from __future__ import annotations
+
+import getpass
+import hashlib
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+
+def fail(message: str, code: int = 1) -> None:
+    print(f"\n[ERROR] {message}")
+    sys.exit(code)
+
+
+def run(cmd: list[str], *, stdin_text: str | None = None) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(
+            cmd,
+            input=stdin_text,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        fail(
+            "OpenSSL was not found. Install OpenSSL and make sure the "
+            "'openssl' command is available in PATH."
+        )
+
+
+def ask_file(prompt: str) -> Path:
+    while True:
+        raw = input(prompt).strip().strip('"').strip("'")
+        if not raw:
+            print("[!] Path cannot be empty.")
+            continue
+        p = Path(os.path.expanduser(raw)).resolve()
+        if not p.is_file():
+            print(f"[!] File does not exist: {p}")
+            continue
+        return p
+
+
+def ask_new_password() -> str:
+    while True:
+        p1 = getpass.getpass(
+            "\nEnter NEW password for generated client.p12: "
+        )
+        if not p1:
+            print("[!] Password cannot be empty.")
+            continue
+        p2 = getpass.getpass("Confirm NEW client.p12 password: ")
+        if p1 != p2:
+            print("[!] Passwords do not match.")
+            continue
+        return p1
+
+
+def detect_cert_format(path: Path) -> str:
+    data = path.read_bytes()
+    if b"-----BEGIN CERTIFICATE-----" in data:
+        return "PEM"
+
+    result = run([
+        "openssl", "x509",
+        "-inform", "DER",
+        "-in", str(path),
+        "-noout",
+    ])
+    if result.returncode == 0:
+        return "DER"
+
+    return "UNKNOWN"
+
+
+def detect_key_format(path: Path) -> str:
+    data = path.read_bytes()
+
+    if b"-----BEGIN " in data and b"PRIVATE KEY-----" in data:
+        return "PEM"
+
+    result = run([
+        "openssl", "pkey",
+        "-inform", "DER",
+        "-in", str(path),
+        "-noout",
+    ])
+    if result.returncode == 0:
+        return "DER"
+
+    return "UNKNOWN"
+
+
+def normalize_certificate(
+    cert_path: Path, cert_format: str, out_path: Path
+) -> None:
+    cmd = ["openssl", "x509"]
+    if cert_format == "DER":
+        cmd += ["-inform", "DER"]
+    cmd += ["-in", str(cert_path), "-out", str(out_path)]
+
+    result = run(cmd)
+    if result.returncode != 0:
+        fail("Could not parse/normalize the client certificate:\n" + result.stderr.strip())
+
+
+def normalize_private_key(
+    key_path: Path,
+    key_format: str,
+    out_path: Path,
+    key_password: str | None,
+) -> None:
+    cmd = ["openssl", "pkey"]
+    if key_format == "DER":
+        cmd += ["-inform", "DER"]
+    cmd += ["-in", str(key_path), "-out", str(out_path)]
+
+    if key_password is not None:
+        cmd += ["-passin", "stdin"]
+        result = run(cmd, stdin_text=key_password + "\n")
+    else:
+        result = run(cmd)
+
+    if result.returncode != 0:
+        fail("Could not parse/normalize the private key:\n" + result.stderr.strip())
+
+
+def validate_private_key(
+    key_path: Path, key_format: str
+) -> tuple[bool, str | None]:
+    cmd = ["openssl", "pkey"]
+    if key_format == "DER":
+        cmd += ["-inform", "DER"]
+    cmd += ["-in", str(key_path), "-noout"]
+
+    result = run(cmd)
+    if result.returncode == 0:
+        return True, None
+
+    error = (result.stderr or "").lower()
+
+    encrypted = (
+        b"ENCRYPTED PRIVATE KEY" in key_path.read_bytes()
+        or "bad decrypt" in error
+        or "bad password" in error
+        or "maybe wrong password" in error
+        or "pass phrase" in error
+        or "password" in error
+    )
+
+    return False, "encrypted" if encrypted else result.stderr.strip()
+
+
+def public_key_hash_from_cert(cert_pem: Path) -> str:
+    result = run([
+        "openssl", "x509",
+        "-in", str(cert_pem),
+        "-pubkey",
+        "-noout",
+    ])
+    if result.returncode != 0:
+        fail("Unable to extract public key from certificate.")
+
+    tmp = Path(tempfile.mkstemp(prefix="cert_pub_", suffix=".pem")[1])
+    try:
+        tmp.write_text(result.stdout)
+        der = run([
+            "openssl", "pkey",
+            "-pubin",
+            "-in", str(tmp),
+            "-outform", "DER",
+        ])
+        if der.returncode != 0:
+            fail("Unable to normalize certificate public key.")
+        return hashlib.sha256(der.stdout.encode() if isinstance(der.stdout, str)
+                              else der.stdout).hexdigest()
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def public_key_hash_from_key(key_pem: Path) -> str:
+    result = run([
+        "openssl", "pkey",
+        "-in", str(key_pem),
+        "-pubout",
+    ])
+    if result.returncode != 0:
+        fail("Unable to extract public key from private key.")
+
+    tmp = Path(tempfile.mkstemp(prefix="key_pub_", suffix=".pem")[1])
+    try:
+        tmp.write_text(result.stdout)
+        der = run([
+            "openssl", "pkey",
+            "-pubin",
+            "-in", str(tmp),
+            "-outform", "DER",
+        ])
+        if der.returncode != 0:
+            fail("Unable to normalize private-key public key.")
+        return hashlib.sha256(der.stdout.encode() if isinstance(der.stdout, str)
+                              else der.stdout).hexdigest()
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def show_certificate_info(cert_pem: Path) -> None:
+    result = run([
+        "openssl", "x509",
+        "-in", str(cert_pem),
+        "-noout",
+        "-subject",
+        "-issuer",
+        "-serial",
+        "-dates",
+    ])
+    if result.returncode == 0:
+        print("\n[+] Client certificate information:")
+        print(result.stdout.strip())
+
+
+def check_validity(cert_pem: Path) -> None:
+    result = run([
+        "openssl", "x509",
+        "-in", str(cert_pem),
+        "-checkend", "0",
+        "-noout",
+    ])
+    if result.returncode == 0:
+        print("[+] Certificate is currently valid according to OpenSSL.")
+    else:
+        print("[!] WARNING: Certificate is expired or not yet valid.")
+
+
+def check_eku(cert_pem: Path) -> None:
+    result = run([
+        "openssl", "x509",
+        "-in", str(cert_pem),
+        "-noout",
+        "-ext", "extendedKeyUsage",
+    ])
+
+    text = (result.stdout or "").strip()
+    if result.returncode != 0 or not text:
+        print("[!] Extended Key Usage extension not present/readable.")
+        return
+
+    print("\n[+] Extended Key Usage:")
+    print(text)
+
+    if re.search(
+        r"TLS Web Client Authentication|clientAuth|Client Authentication",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        print("[+] Client Authentication EKU detected.")
+    else:
+        print("[!] WARNING: Client Authentication EKU was not detected.")
+
+
+def extract_pem_cert_chain(cert_path: Path, workdir: Path) -> Path | None:
+    try:
+        text = cert_path.read_text(errors="strict")
+    except UnicodeDecodeError:
+        return None
+
+    blocks = re.findall(
+        r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----",
+        text,
+        flags=re.DOTALL,
+    )
+
+    if len(blocks) <= 1:
+        return None
+
+    chain_path = workdir / "chain.pem"
+    chain_path.write_text("\n".join(blocks[1:]) + "\n")
+    print(f"[+] Detected {len(blocks)} certificate blocks in the PEM file.")
+    print(f"[+] Including {len(blocks) - 1} additional certificate(s) as chain.")
+    return chain_path
+
+
+def create_pkcs12(
+    cert_pem: Path,
+    key_pem: Path,
+    chain_pem: Path | None,
+    output: Path,
+    p12_password: str,
+) -> None:
+    cmd = [
+        "openssl", "pkcs12",
+        "-export",
+        "-out", str(output),
+        "-in", str(cert_pem),
+        "-inkey", str(key_pem),
+        "-name", "Burp-mTLS-client",
+        "-passout", "stdin",
+    ]
+
+    if chain_pem:
+        cmd += ["-certfile", str(chain_pem)]
+
+    result = run(cmd, stdin_text=p12_password + "\n")
+    if result.returncode != 0:
+        fail("PKCS#12 creation failed:\n" + result.stderr.strip())
+
+
+def verify_pkcs12(output: Path, p12_password: str) -> None:
+    result = run([
+        "openssl", "pkcs12",
+        "-info",
+        "-in", str(output),
+        "-noout",
+        "-passin", "stdin",
+    ], stdin_text=p12_password + "\n")
+
+    if result.returncode != 0:
+        fail(
+            "Generated client.p12 could not be opened with the password "
+            "you entered:\n" + result.stderr.strip()
+        )
+
+    combined = ((result.stdout or "") + (result.stderr or "")).lower()
+
+    # OpenSSL writes some PKCS#12 details to stderr.
+    if "private key" not in combined:
+        print("[!] WARNING: Could not clearly confirm a private key in the PKCS#12.")
+    else:
+        print("[+] Private key present in PKCS#12.")
+
+    if "certificate" not in combined:
+        print("[!] WARNING: Could not clearly confirm a certificate in the PKCS#12.")
+    else:
+        print("[+] Certificate present in PKCS#12.")
+
+
+def main() -> None:
+    print("=" * 76)
+    print(" Burp Suite mTLS client.p12 creator")
+    print("=" * 76)
+    print("Converts a client certificate + private key into a password-protected")
+    print("PKCS#12 container suitable for Burp's Client TLS Certificates setting.")
+    print("Your original files are not modified.\n")
+
+    openssl = run(["openssl", "version"])
+    if openssl.returncode != 0:
+        fail("OpenSSL is unavailable.")
+    print(f"[+] {openssl.stdout.strip()}")
+
+    cert_path = ask_file("Enter CLIENT CERTIFICATE file path: ")
+    key_path = ask_file("Enter PRIVATE KEY file path: ")
+    p12_password = ask_new_password()
+
+    print("\n[*] Detecting certificate format...")
+    cert_format = detect_cert_format(cert_path)
+    print(f"[+] Certificate: {cert_format}")
+    if cert_format == "UNKNOWN":
+        fail("Certificate is not recognized as PEM or DER X.509.")
+
+    print("[*] Detecting private-key format...")
+    key_format = detect_key_format(key_path)
+    print(f"[+] Private key: {key_format}")
+    if key_format == "UNKNOWN":
+        fail("Private key is not recognized as supported PEM/DER.")
+
+    workdir = Path(tempfile.mkdtemp(prefix="burp_mtls_"))
+
+    try:
+        cert_pem = workdir / "client-cert.pem"
+        key_pem = workdir / "client-key.pem"
+
+        print("\n[*] Validating and normalizing certificate...")
+        normalize_certificate(cert_path, cert_format, cert_pem)
+        print("[+] Certificate OK.")
+        show_certificate_info(cert_pem)
+        check_validity(cert_pem)
+        check_eku(cert_pem)
+
+        print("\n[*] Validating private key...")
+        key_ok, key_status = validate_private_key(key_path, key_format)
+
+        existing_key_password = None
+        if not key_ok:
+            if key_status == "encrypted":
+                print("[*] Private key is encrypted.")
+                print("[*] This is the EXISTING password protecting the private key.")
+                existing_key_password = getpass.getpass(
+                    "Enter existing PRIVATE KEY password: "
+                )
+                # Validate with the password before proceeding.
+                temp_check = run(
+                    ["openssl", "pkey"] +
+                    (["-inform", "DER"] if key_format == "DER" else []) +
+                    ["-in", str(key_path), "-noout", "-passin", "stdin"],
+                    stdin_text=existing_key_password + "\n",
+                )
+                if temp_check.returncode != 0:
+                    fail("Could not unlock the private key with that password.")
+            else:
+                fail(f"Private key could not be read:\n{key_status}")
+
+        normalize_private_key(
+            key_path, key_format, key_pem, existing_key_password
+        )
+        print("[+] Private key OK.")
+
+        print("\n[*] Checking whether certificate and private key MATCH...")
+        cert_hash = public_key_hash_from_cert(cert_pem)
+        key_hash = public_key_hash_from_key(key_pem)
+
+        print(f"[+] Certificate public-key SHA-256: {cert_hash}")
+        print(f"[+] Private-key public-key SHA-256: {key_hash}")
+
+        if cert_hash != key_hash:
+            fail(
+                "CERTIFICATE AND PRIVATE KEY DO NOT MATCH.\n"
+                "Obtain the correct pair before creating the PKCS#12 file."
+            )
+
+        print("[+] MATCH confirmed.")
+
+        chain_pem = extract_pem_cert_chain(cert_path, workdir)
+
+        default_output = Path.cwd() / "client.p12"
+        raw_out = input(
+            f"\nOutput file [default: {default_output}]: "
+        ).strip().strip('"').strip("'")
+        output = (
+            Path(os.path.expanduser(raw_out)).resolve()
+            if raw_out
+            else default_output.resolve()
+        )
+
+        if output.exists():
+            confirm = input(
+                f"[!] {output} already exists. Overwrite? [y/N]: "
+            ).strip().lower()
+            if confirm != "y":
+                fail("Cancelled.")
+            output.unlink()
+
+        print("\n[*] Creating client.p12...")
+        create_pkcs12(
+            cert_pem,
+            key_pem,
+            chain_pem,
+            output,
+            p12_password,
+        )
+
+        # Restrict file permissions where supported.
+        try:
+            os.chmod(output, 0o600)
+        except OSError:
+            pass
+
+        print("[+] PKCS#12 created.")
+
+        print("\n[*] Verifying generated client.p12...")
+        verify_pkcs12(output, p12_password)
+
+        print("\n" + "=" * 76)
+        print(" SUCCESS")
+        print("=" * 76)
+        print(f"Created: {output}")
+        print("\nUse this in Burp Suite:")
+        print("  Settings -> Network -> TLS -> Client TLS Certificates")
+        print("  Add -> select this client.p12")
+        print("  Enter the NEW password you just created")
+        print("  Configure the rule for the exact API destination hostname.")
+        print("\nRemember:")
+        print("  client.p12 = API/TPP client identity")
+        print("  Burp CA   = separately trusted by Postman for interception")
+        print("=" * 76)
+
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+path = Path("/mnt/data/burp_mtls_p12_creator.py")
+path.write_text(script, encoding="utf-8")
+os.chmod(path, 0o700)
+print(path)
+
+
+It seems like I can’t do more advanced data analysis right now. Please try again later. 
